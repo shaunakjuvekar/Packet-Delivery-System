@@ -1,0 +1,144 @@
+#!/usr/bin/env perl
+
+my $SEND = "4254send";
+my $RECV = "4254recv";
+my $NETSIM = "/usr/local/bin/netsim";
+my $RUN = "/usr/local/bin/nettest";
+
+if (! (-e $SEND)) {
+  die("Unable to find executable '$SEND'.\n");
+}
+
+if (! (-e $RECV)) {
+  die("Unable to find executable '$RECV'.\n");
+}
+
+if (! (-e $NETSIM)) {
+  die("Unable to find executable '$NETSIM'.\n");
+}
+if (! (-e $RUN)) {
+  die("Unable to find executable '$RUN'.\n");
+}
+
+
+print "Basic (friendly network) tests\n";
+runTest("Small 1 Mb/s, 10 ms latency", "", "--size small");
+runTest("Small 0.1 Mb/s 10 ms latency", "--bandwidth 0.1", "--size small");
+runTest("Small 0.1 Mb/s 50 ms latency", "--bandwidth 0.1 --latency 50", "--size small");
+runTest("Medium 1 Mb/s, 10 ms latency", "", "--size medium");
+runTest("Medium 0.1 Mb/s 10 ms latency", "--bandwidth 0.1", "--size medium");
+runTest("Medium 0.1 Mb/s 50 ms latency", "--bandwidth 0.1 --latency 50", "--size medium");
+runTest("Large 1 Mb/s, 10 ms latency", "", "--size large");
+runTest("Large 0.5 Mb/s 10 ms latency", "--bandwidth 0.5", "--size large");
+runTest("Large 0.1 Mb/s 500 ms latency", "--bandwidth 0.1 --latency 500", "--size large");
+
+print "\nAdvanced tests\n";
+runTest("Small 1Mb/s, 10 ms, 100% duplicate", "--duplicate 100", "--size small --timeout 15");
+runTest("Medium 1Mb/s, 10 ms, 50% reorder 10% drop", "--drop 10 --reorder 50", "--size medium --timeout 30");
+runTest("Medium 1Mb/s, 10 ms, 50% drop", "--drop 50", "--size medium --timeout 30");
+runTest("Medium 1Mb/s, 10 ms, 50% delay 25% duplicate", "--delay 50 --duplicate 25", "--size medium --timeout 30");
+runTest("Medium 5Mb/s, 10 ms, 5% delay 5% duplicate 5% drop", "--bandwidth 5 --delay 5 --duplicate 5 --drop 5", "--size medium --timeout 30");
+runTest("Large 1Mb/s, 10 ms, 10% delay 10% duplicate", "--delay 10 --duplicate 10", "--size large --timeout 30");
+runTest("Large 10Mb/s, 10ms, 1% delay 1% duplicate 1% drop", "--bandwidth 10 --delay 1 --drop 1 --duplicate 1", "--size large --timeout 60");
+
+print "\nPerformance tests\n";
+runPerfTest(5, 10, 0, 0, 0, "huge");
+runPerfTest(5, 10, 10, 0, 0, "large");
+runPerfTest(5, 50, 10, 0, 0, "large");
+runPerfTest(10, 25, 10, 10, 20, "large");
+
+sub runTest {
+  my ($problem, $simargline, $runargs) = @_;
+
+  print pad("  $problem", 60);
+  `$NETSIM $simargline`;
+  $output = `$RUN $runargs`;
+
+  if ($output =~ m|Data match: Yes|) {
+    print "[ PASS ]\n";
+  } else {
+    print "[ FAIL ]\n";
+  }
+}
+
+sub perfScore {
+  my ($r_measured, $bw, $lat, $drop) = @_;
+
+  $bw = $bw * 1000 * 1000;
+
+  my $r_min = 2100000 * (1 + $drop/100) / $lat; # Constant = (pkt_bytes*8)/(timeconv_factor)
+  my $r_tgt = $bw * 2 / 4;
+
+  if ($r_min > ($bw / 2)) {
+    $r_min = $bw / 2;
+  }
+
+  if ($r_measured < $r_min) {
+    return 0;
+  } elsif ($r_measured > $r_tgt) {
+    return 100;
+  } else {
+    return int(($r_measured - $r_min) / ($r_tgt - $r_min));
+  }
+}
+
+sub runPerfTest {
+  my ($bw, $lat, $drop, $dup, $del, $size) = @_;
+
+  print pad("  $size $bw Mb/s, $lat ms, $drop% drop, $dup% duplicate $del% delay", 60);
+  `$NETSIM --bandwidth $bw --latency $lat --drop $drop --duplicate $dup --delay $del`;
+  $output = `$RUN --size $size 2>&1`;
+
+  if ($output =~ m|Data match: Yes|) {
+    print("[DATAOK]\n");
+    my $bytes = "Unknown";
+    my $time = "Unknown";
+
+    if ($output =~ m|Msg Size: ([0-9\.]*)|) { $bytes = $1; }
+    if ($output =~ m|Time elapsed: ([0-9\.]*)|) { $time = $1; }
+
+    $time = $time / 1000;
+    $bytes = int($bytes);
+    my $str_time = sprintf("%.3f", $time);
+    my $str_bytes = format_bytes($bytes) . "B";
+    print("    $str_time sec elapsed, $str_bytes sent\n");
+
+    my $m_goodput = 8 * $bytes / $time;
+    my $str_goodput = format_bytes($m_goodput) . "b/s";
+    print pad("    Rate: $str_goodput", 60);
+
+    my $perf_score = perfScore($m_goodput, $bw, $lat, $drop);
+    if ($perf_score == 0) {
+      print("[ FAIL ]\n");
+    } elsif ($perf_score == 100) {
+      print("[ OKAY ]\n");
+    } else {
+      print("[PERF$perf_score]\n");
+    }
+  } else {
+    print("[DATERR]\n");
+    $output =~ s/\n/\n    /g;
+    print("    " . $output . "\n");
+  }
+}
+
+sub pad {
+  my ($name, $len) = @_;
+  while (length($name) < $len) {
+    $name = "$name ";
+  }
+  if (length($name) > $len) {
+    $name = substr($name, 0, $len-3) . "...";
+  }
+  return $name;
+}
+
+sub format_bytes {
+  my ($a) = @_;
+
+  if ($a < 1024) { return $a; }
+  if ($a < 1024 * 1024) { return int($a/1024) . "K"; }
+  if ($a < 1024 * 1024 * 1024) { return int($a/(1024*1024)) . "M"; }
+  if ($a < 1024 * 1024 * 1024 * 1024) { return int($a/(1024*1024*1024)) . "G"; }
+}
+

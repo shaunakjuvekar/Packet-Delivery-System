@@ -1,0 +1,161 @@
+#!/usr/bin/env python3
+
+import argparse
+import base64
+import filecmp
+import io
+import os
+import os.path
+import random
+import re
+import select
+import subprocess
+import sys
+import traceback
+
+from fcntl import fcntl, F_GETFL, F_SETFL
+from threading import Thread
+from time import sleep, strftime, time
+
+SEND = "./4254send"
+RECV = "./4254recv"
+TC_RE = re.compile("Sent (?P<bytes>[0-9]*) bytes (?P<pkts>[0-9]*) pkt")
+FNAME_POOL = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+PAGE_SIZE = 4096
+DATA_SIZE = 1000
+SIZE_MAP = {
+    "small": 1000,
+    "medium": 10000,
+    "large": 100000,
+    "huge": 1000000
+}
+
+
+def check_env():
+  if not (os.path.exists(SEND) and os.path.exists(RECV)):
+    raise RuntimeError("Error: Could not find executables")
+  if not (os.access(SEND, os.X_OK) and os.access(RECV, os.X_OK)):
+    raise RuntimeError("Error: Executables are not executable. "
+                       "Fix with 'chmod u+x 4254send 4254recv'.")
+
+def parse_args():
+  parser = argparse.ArgumentParser()
+  parser.add_argument("--live", action="store_true")
+  parser.add_argument("--size", choices=["small", "medium", "large", "huge"],
+                      default="small")
+  parser.add_argument("--timeout", type=int, default=30)
+  return parser.parse_args()
+
+def generate_data(size):
+  fname = "/tmp/temp." + ''.join(random.choices(FNAME_POOL, k=8))
+  bytes_remaining = size
+  with open(fname, 'wb') as ofp:
+    while bytes_remaining > 0:
+      size = min(PAGE_SIZE, bytes_remaining)
+      next_page = ''.join(chr(random.randint(0, 127)) for _ in range(0, size))
+      ofp.write(next_page.encode('ascii'))
+      bytes_remaining -= len(next_page)
+  return fname
+
+def get_traffic():
+  tc_result = subprocess.run(["tc", "-s", "qdisc", "show", "dev", "lo"],
+                             stdout=subprocess.PIPE,
+                             check=True)
+  tc_out = TC_RE.search(tc_result.stdout.decode('ascii')).groupdict()
+  return (int(tc_out["bytes"]), int(tc_out["pkts"]))
+
+def cmp(fname1, fname2):
+  fsize1 = os.path.getsize(fname1)
+  fsize2 = os.path.getsize(fname2)
+  if os.path.getsize(fname1) != os.path.getsize(fname2):
+    return f"Files not same size ({fsize1} != {fsize2})"
+
+  posn = 0
+  with open(fname1, 'rb') as fp1, open(fname2, 'rb') as fp2:
+    b1 = fp1.read(PAGE_SIZE)
+    b2 = fp2.read(PAGE_SIZE)
+    for i in range(0, len(b1)):
+      if b1[i] != b2[i]:
+        return f"Files differ ({int(b1[i]):d} != {int(b2[i]):d} at byte {posn+i})"
+    posn += PAGE_SIZE
+
+  return None
+
+def print_results(time_start, packets_start, bytes_start,
+                  time_end, packets_end, bytes_end,
+                  size_msg, cmp_res):
+  time_dur_ms = (time_end - time_start) * 1000
+  packets_sent = packets_end - packets_start
+  bytes_sent = bytes_end - bytes_start
+
+  if cmp_res is None:
+    print("Data match: Yes")
+  else:
+    print("Data match: No")
+    print(cmp_res)
+
+  print(f"Msg Size: {size_msg:d} B\n"
+        f"Time elapsed: {time_dur_ms:.3f} ms\n"
+        f"Packets sent: {packets_sent:d}\n"
+        f"Data on Wire: {bytes_sent:d} B")
+
+def main(fdatain_name, fdataout_name, args):
+  port = random.randint(12500, 65000)
+  (bytes_start, packets_start) = get_traffic()
+  time_start = time()
+
+  with open(fdatain_name, 'rb') as fpdatain, open(fdataout_name, 'wb') as fpdataout:
+    stderr_tgt = sys.stdout if args.live else subprocess.DEVNULL
+    recv = subprocess.Popen([RECV, str(port)], stdout=fpdataout,
+                            stderr=stderr_tgt)
+    send = subprocess.Popen([SEND, f"127.0.0.1:{port}"], stdin=fpdatain,
+                            stderr=stderr_tgt)
+    try:
+      send.wait(args.timeout)
+    except subprocess.TimeoutExpired:
+      send.terminate()
+      recv.terminate()
+      raise RuntimeError(f"Timeout waiting on {SEND}")
+    else:
+      if send.returncode != 0:
+        raise RuntimeError(f"{SEND} exited with code {send.returncode}")
+    try:
+      recv.wait(5)
+    except subprocess.TimeoutExpired:
+      recv.terminate()
+      raise RuntimeError(f"Timeout waiting on {RECV}")
+    else:
+      if recv.returncode != 0:
+        raise RuntimeError(f"{RECV} exited with code {recv.returncode}")
+
+  time_end = time()
+  (bytes_end, packets_end) = get_traffic()
+
+  time_dur = time_end - time_start
+  cmp_res = cmp(fdatain_name, fdataout_name)
+  print_results(time_start, packets_start, bytes_start,
+                time_end, packets_end, bytes_end,
+                SIZE_MAP[args.size], cmp_res)
+
+if __name__ == "__main__":
+  check_env()
+  args = parse_args()
+  fdatain_name = generate_data(SIZE_MAP[args.size])
+  fdataout_name = strftime("/tmp/fout_%H%M%S")
+  try:
+    main(fdatain_name, fdataout_name, args)
+  except RuntimeError as exc:
+    print(exc)
+  except Exception:
+    logf_name = strftime("exc_%Y%m%d_%H%M%S.log")
+    with open(logf_name, 'w') as logf:
+      traceback.print_exc(file=logf)
+    print("An internal error has occurred. "
+          "Please reach out to course staff for assistance. "
+          f"Please attach the file {logf_name} with your note.")
+  finally:
+    for fname in [fdatain_name, fdataout_name]:
+      if os.path.exists(fname):
+        os.remove(fname)
+
+

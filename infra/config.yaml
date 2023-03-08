@@ -1,0 +1,15 @@
+num_pairs:
+  - offset: 0
+    filesize: huge
+  - offset: 5
+    filesize: medium
+  - offset: 10
+    filesize: medium
+  - offset: 15
+    filesize: medium
+  - offset: 20
+    filesize: medium
+  - offset: 20
+    filesize: medium
+  - offset: 25
+    filesize: small

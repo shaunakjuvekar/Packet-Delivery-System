@@ -1,0 +1,31 @@
+#!/usr/bin/python3 -u
+
+import datetime
+import socket
+import sys
+
+from src.logging import get_logger
+from src.receiver import Receiver
+
+logger = get_logger("[4254recv] main")
+
+
+MSG_SIZE = 1500
+TIMEOUT = 10
+
+# Bind to localhost and an ephemeral port
+UDP_IP = "127.0.0.1"
+UDP_PORT = int(sys.argv[1])
+
+# Set up the socket
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+sock.bind((UDP_IP, UDP_PORT))
+sock.settimeout(TIMEOUT)
+
+# Get port we bound to
+UDP_PORT = sock.getsockname()[1]
+logger.info("Socket bound to " + str(UDP_PORT))
+
+receiver = Receiver(sock=sock, message_size=MSG_SIZE)
+receiver.run()
+receiver.print()

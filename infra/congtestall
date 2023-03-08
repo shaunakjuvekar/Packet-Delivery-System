@@ -1,0 +1,53 @@
+#!/usr/bin/env perl
+
+my $SEND = "4254send";
+my $RECV = "4254recv";
+my $NETSIM = "/usr/local/bin/netsim";
+my $RUN = "/usr/local/bin/nettest";
+my $CGST = "/usr/local/bin/congestiontest";
+
+if (! (-e $SEND)) {
+  die("Unable to find executable '$SEND'.\n");
+}
+
+if (! (-e $RECV)) {
+  die("Unable to find executable '$RECV'.\n");
+}
+
+if (! (-e $NETSIM)) {
+  die("Unable to find executable '$NETSIM'.\n");
+}
+if (! (-e $RUN)) {
+  die("Unable to find executable '$RUN'.\n");
+}
+
+
+
+print "\nRunning Congestion Test\n";
+runCongestionTest("Medium 0.1 Mb/s 50 ms latency", "--bandwidth 0.1 --latency 50", 3, "large");
+
+runSim("Large 0.5 Mb/s 10 ms latency", "--bandwidth 0.5");
+runCongestionTest("", "", 2, 'huge');
+
+
+
+sub runCongestionTest {
+  my ($problem, $simargline, $numpairs, $size) = @_;
+
+  print "\n  $problem\n";
+  `$NETSIM $simargline`;
+
+  if ($numpairs == 1) { print "  Transfer $size data between $numpairs pair\n"; }
+  else { print "  Transfer $size data between $numpairs pairs\n"; }
+
+  $output = `$CGST --size=$size --numpairs=$numpairs `;
+
+}
+
+sub runSim {
+  my ($problem, $simargline) = @_;
+
+  print "\n  $problem\n";
+  `$NETSIM $simargline`;
+
+}

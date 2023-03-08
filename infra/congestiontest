@@ -1,0 +1,278 @@
+#!/usr/bin/env python3
+
+import argparse
+import base64
+import filecmp
+import io
+import os
+import os.path
+import random
+import re
+import select
+import subprocess
+import sys
+import traceback
+import csv
+import json
+import yaml
+
+from fcntl import fcntl, F_GETFL, F_SETFL
+from threading import Thread
+from time import strftime
+import time
+from multiprocessing import Process
+import threading
+
+SEND = "./4254send"
+RECV = "./4254recv"
+TC_RE = re.compile("Sent (?P<bytes>[0-9]*) bytes (?P<pkts>[0-9]*) pkt")
+FNAME_POOL = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+PAGE_SIZE = 4096
+DATA_SIZE = 1000
+SIZE_MAP = {
+    "small": 1000,
+    "medium": 10000,
+    "large": 100000,
+    "huge": 1000000
+}
+
+
+def check_env():
+  if not (os.path.exists(SEND) and os.path.exists(RECV)):
+    raise RuntimeError("Error: Could not find executables")
+  if not (os.access(SEND, os.X_OK) and os.access(RECV, os.X_OK)):
+    raise RuntimeError("Error: Executables are not executable. "
+                       "Fix with 'chmod u+x 4254send 4254recv'.")
+
+
+def parse_args():
+  parser = argparse.ArgumentParser()
+  parser.add_argument("--live", action="store_true", help="Echo the STDERR output of sender and receiver processes to terminal")
+  parser.add_argument("--timeout", type=int, default=200, help="set max time in seconds for which both sender and receiver processes will run")
+  parser.add_argument("--size", choices=["small", "medium", "large", "huge"],
+                      default="small", help="set size of data to be sent (ignored if using a config file)")
+  group = parser.add_mutually_exclusive_group()
+  group.add_argument("--numpairs", type=int, default=1, help="set number of sender-receiver pairs")
+  group.add_argument('--config', type=str, default=None, help="Path to a json config file")
+  return parser.parse_args()
+
+
+def generate_data(size):
+  fname = "/tmp/temp." + ''.join(random.choices(FNAME_POOL, k=8))
+  bytes_remaining = size
+  with open(fname, 'wb') as ofp:
+    while bytes_remaining > 0:
+      size = min(PAGE_SIZE, bytes_remaining)
+      next_page = ''.join(chr(random.randint(0, 127)) for _ in range(0, size))
+      ofp.write(next_page.encode('ascii'))
+      bytes_remaining -= len(next_page)
+  return fname
+
+
+def create_traffic_rule(ports):
+  for port in ports:
+    subprocess.run(["sudo", "iptables", "-A", "TRAFFIC", "-p", "udp", "--dport", f"{port}"],
+                              stdout=subprocess.PIPE,
+                              check=True)
+
+
+def delete_traffic_rule(ports):
+  try:
+    for port in ports:
+      deleted = subprocess.run(["sudo", "iptables", "-D", "TRAFFIC", "-p", "udp", "--dport", f"{port}"],
+                              stdout=subprocess.PIPE,
+                              check=True)
+  except Exception:
+      print('error while deleting TRAFFIC')
+
+
+def send_and_receive(repeats, fdatain_name, fdataout_name, args, port, sleeptime):
+  time.sleep(sleeptime)
+
+  for _ in range(repeats):
+    with open(fdatain_name, 'rb') as fpdatain, open(fdataout_name, 'wb') as fpdataout:
+      stderr_tgt = sys.stdout if args.live else subprocess.DEVNULL
+      recv = subprocess.Popen([RECV, str(port)], stdout=fpdataout,
+                              stderr=stderr_tgt)
+      send = subprocess.Popen([SEND, f"127.0.0.1:{port}"], stdin=fpdatain,
+                              stderr=stderr_tgt)
+      try:
+        send.wait(args.timeout)
+      except subprocess.TimeoutExpired:
+        send.terminate()
+        recv.terminate()
+        raise RuntimeError(f"Timeout waiting on {SEND}")
+      else:
+        if send.returncode != 0:
+          raise RuntimeError(f"{SEND} exited with code {send.returncode}")
+      try:
+        recv.wait(args.timeout)
+      except subprocess.TimeoutExpired:
+        recv.terminate()
+        raise RuntimeError(f"Timeout waiting on {RECV}")
+      else:
+        if recv.returncode != 0:
+          raise RuntimeError(f"{RECV} exited with code {recv.returncode}")
+
+
+def preproc_ip_output(output):
+  idxlist = [i for i, val in enumerate(output) if "dpt" in val]
+  final_list = lambda test_list, x: [test_list[i:i+x] for i in range(0, len(test_list), x)]
+  outputlist = final_list(output, idxlist[0]+1)
+  outputlist = [[x[0], x[1], x[-1]] for x in outputlist]
+  return outputlist
+
+def gather_persec_results(ports, sr_threads):
+  port_thread_map = dict(zip(sr_threads, ports))
+  
+  prev_realbyte_cnt = dict.fromkeys(ports, 0)
+  prev_totalbyte_cnt = dict.fromkeys(ports, 0)
+  prev_realpckt_cnt = dict.fromkeys(ports, 0)
+  prev_totalpckt_cnt = dict.fromkeys(ports, 0)
+  offset_bytes = dict.fromkeys(ports, 0)
+  offset_pckts = dict.fromkeys(ports, 0)
+
+  single_prev_tmstmp = 0
+
+  if not os.path.exists('logs'):
+    os.makedirs('logs')
+
+  fname = strftime("logs/log_%Y%m%d_%H%M%S.csv")
+  fwrite = open(fname, 'w+', encoding='UTF8')
+  writer = csv.writer(fwrite)
+  columns = ['Port', 'Timestamp', 'tput in bits per sec', 'bytes in last sec', 'packets in last sec', 'total bytes', 'total packets']
+  writer.writerow(columns)
+
+  single_prev_tmstmp = time.time_ns() / 1e9
+  time.sleep(1)
+
+  while True:
+    tmstmp = time.time_ns() / 1e9
+    time_diff = tmstmp - single_prev_tmstmp
+    single_prev_tmstmp = tmstmp
+    res = subprocess.run(["sudo", "iptables", "-L", "TRAFFIC", "-n", "-v", "-x"],
+                              stdout=subprocess.PIPE,
+                              check=True)
+    ipstats = res.stdout.decode("utf-8")
+    ipstats = ipstats.split()
+    ipstats = ipstats[13:]  # getting rid of header info in the first 13 indices
+    ipstats = preproc_ip_output(ipstats)
+    
+    # iterate through all the values we get back, but only pay attention to our ports
+    for idx in range(0, len(ipstats)):
+      # check if the current port is in the ports that we are using for active sr_threads
+      if ipstats[idx][2] not in ["dpt:%d" % _ for _ in ports]:
+          continue # not one of ours
+      port = int(ipstats[idx][2][4:])
+
+      total_pckts = int(ipstats[idx][0])
+      curr_pckts = total_pckts - prev_totalpckt_cnt[port] + offset_pckts[port]
+      curr_pckts = round(curr_pckts/time_diff)
+      prev_realpckt_cnt[port] += curr_pckts
+      offset_pckts[port] = total_pckts - prev_realpckt_cnt[port]
+      prev_totalpckt_cnt[port] = total_pckts
+
+      total_bytes = int(ipstats[idx][1])
+      curr_bytes = total_bytes - prev_totalbyte_cnt[port] + offset_bytes[port]
+      curr_bytes = round(curr_bytes/time_diff)
+      prev_realbyte_cnt[port] += curr_bytes
+      offset_bytes[port] = total_bytes - prev_realbyte_cnt[port]
+      prev_totalbyte_cnt[port] = total_bytes
+
+      bits_psec = curr_bytes*8
+
+      tmplist = [ipstats[idx][2].split(":")[1], tmstmp, bits_psec, curr_bytes, curr_pckts, prev_realbyte_cnt[port], prev_realpckt_cnt[port]]
+      writer.writerow(tmplist)
+
+    # Safely removing inactive ports, threads
+    sr_threads_alive = False
+    for thread in list(sr_threads):
+      if thread.is_alive() == False:
+        ports.pop(ports.index(port_thread_map[thread]))
+        sr_threads.remove(thread)
+      else:
+        sr_threads_alive = True
+    # Exiting when all the threads are not alive
+    if sr_threads_alive == False:
+      fwrite.close()
+      break
+
+    fwrite.flush()
+    time.sleep(1)
+
+
+def get_config(path):
+  try:
+    with open(path, 'r') as file:
+      pairs = yaml.safe_load(file)
+    numpairs = len(pairs["num_pairs"])
+    configs = []
+    for key_pair in pairs["num_pairs"]:
+      configs.append([key_pair["offset"], key_pair['filesize']])
+
+  except Exception:
+    numpairs = 1
+    configs = [[0, "small"]]
+
+  return numpairs, configs
+
+
+def main(fdatain_name, fdataout_name, args, numpairs, configs):
+  REPEATS = 1
+  ports = random.sample(range(12500, 65000), numpairs)
+
+  create_traffic_rule(ports)
+  sr_threads = []
+  for i, port in enumerate(ports):
+    sr_threads.append(threading.Thread(target = send_and_receive, args=(REPEATS, fdatain_name[i], fdataout_name[i], args, port, int(configs[i][0]))))
+
+  t2 = threading.Thread(target = gather_persec_results, args=(ports, sr_threads))
+
+  t2.start() # start gathering stats first
+  time.sleep(0.2)
+  for t1 in sr_threads:
+    t1.start()
+
+  for t1 in sr_threads:
+    t1.join()
+  t2.join()
+
+  delete_traffic_rule(ports)
+
+
+if __name__ == "__main__":
+  check_env()
+  args = parse_args()
+  configs = []
+
+  if args.config != None:
+    numpairs, configs = get_config(args.config)
+  else:
+    numpairs = args.numpairs
+    for j in range(numpairs):
+      configs.append([0, args.size])
+
+  fdatain_name = []
+  fdataout_name = []
+  for i in range(len(configs)):
+    fdatain_name.append(generate_data(SIZE_MAP[configs[i][1]]))
+    fdataout_name.append(strftime("/tmp/fout_%H%M%S"))
+
+  try:
+    main(fdatain_name, fdataout_name, args, numpairs, configs)
+  except RuntimeError as exc:
+    print(exc)
+  except Exception:
+    logf_name = strftime("exc_%Y%m%d_%H%M%S.log")
+    with open(logf_name, 'w') as logf:
+      traceback.print_exc(file=logf)
+    print("An internal error has occurred. "
+          "Please reach out to course staff for assistance. "
+          f"Please attach the file {logf_name} with your note.")
+  finally:
+    for fname in fdatain_name:
+      if os.path.exists(fname):
+        os.remove(fname)
+    for fname in fdataout_name:
+      if os.path.exists(fname):
+        os.remove(fname)
